@@ -36,13 +36,18 @@ assert practice_result == {"connection_check": 1}
 
 # COMMAND ----------
 
+
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 1. Understand the input
 # MAGIC Record Catalog descriptions, sample observations and the supplied lineage source.
 
 # COMMAND ----------
 
-# Your investigation here.
+# MAGIC %sql
+# MAGIC select * from training.to6_challenge3_inputs.returns_initial limit 3
 
 # COMMAND ----------
 
