@@ -1,0 +1,11 @@
+source_table,return_id,taxpayer_id,tax_year,income,deduction
+training.to6_challenge3_inputs.returns_initial,R01,F0,2022,100,20
+training.to6_challenge3_inputs.returns_initial,R01,F0,2022,100,20
+training.to6_challenge3_inputs.returns_initial,R02,F1,2022,,33
+training.to6_challenge3_inputs.returns_initial,R03,F2,2022,0,46
+training.to6_challenge3_inputs.returns_initial,R04,F3,2022,400,59
+training.to6_challenge3_inputs.returns_corrected,R01,F0,2022,100,20
+training.to6_challenge3_inputs.returns_corrected,R02,F1,2022,200,33
+training.to6_challenge3_inputs.returns_corrected,R03,F2,2022,0,46
+training.to6_challenge3_inputs.returns_corrected,R04,F3,2022,400,59
+training.to6_challenge3_inputs.returns_corrected,R05,F0,2023,500,72
