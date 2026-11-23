@@ -1,0 +1,4 @@
+return_id,taxpayer_id,tax_year,income,deduction,rejection_rule
+R01,F0,2022,100,20,UNIQUENESS – duplicate return_id
+R01,F0,2022,100,20,UNIQUENESS – duplicate return_id
+R02,F1,2022,,33,COMPLETENESS – NULL in required column

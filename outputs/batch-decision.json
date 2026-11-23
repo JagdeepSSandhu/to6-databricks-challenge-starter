@@ -1,0 +1,25 @@
+{
+  "decision": "USE returns_corrected",
+  "reason": "returns_initial violates the data contract: (1) COMPLETENESS \u2013 return R02 has NULL income (a required field); (2) UNIQUENESS \u2013 return_id R01 appears twice (exact duplicate row). These records are preserved in batch_rejections_initial and the CSV export. returns_corrected passes both rules with 12 unique return_ids and no NULLs.",
+  "initial_check": {
+    "table": "training.to6_challenge3_inputs.returns_initial",
+    "total_rows": 13,
+    "distinct_return_ids": 12,
+    "rows_with_null_required": 1,
+    "duplicate_return_ids": 1,
+    "passed": false,
+    "issues": [
+      "COMPLETENESS failure: 1 row(s) with NULL required value(s)",
+      "UNIQUENESS failure: 1 return_id(s) appear more than once"
+    ]
+  },
+  "corrected_check": {
+    "table": "training.to6_challenge3_inputs.returns_corrected",
+    "total_rows": 12,
+    "distinct_return_ids": 12,
+    "rows_with_null_required": 0,
+    "duplicate_return_ids": 0,
+    "passed": true,
+    "issues": []
+  }
+}

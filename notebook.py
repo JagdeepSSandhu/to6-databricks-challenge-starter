@@ -145,7 +145,121 @@ display(check)
 
 # COMMAND ----------
 
-# Your checks and decision here.
+import json
+from pyspark.sql import functions as F
+
+# ── Data-contract rules ─────────────────────────────────────────────
+# 1. COMPLETENESS – every required column must be non-NULL.
+# 2. UNIQUENESS   – return_id must be unique (no duplicate rows).
+REQUIRED_COLS = ["return_id", "taxpayer_id", "tax_year", "income", "deduction"]
+
+def check_batch(table_name):
+    """Run completeness & uniqueness checks. Return (pass/fail, details dict, rejection_df or None)."""
+    df = spark.table(table_name)
+    issues = []
+    rejection_frames = []
+
+    # ── Rule 1: Completeness ──────────────────────────────────────
+    any_null = F.lit(False)
+    for c in REQUIRED_COLS:
+        any_null = any_null | F.col(c).isNull()
+    missing_df = df.where(any_null)
+    n_missing = missing_df.count()
+    if n_missing > 0:
+        issues.append(f"COMPLETENESS failure: {n_missing} row(s) with NULL required value(s)")
+        rejection_frames.append(
+            missing_df.select("*").withColumn("rejection_rule", F.lit("COMPLETENESS – NULL in required column"))
+        )
+
+    # ── Rule 2: Uniqueness on return_id ───────────────────────────
+    dup_ids = df.groupBy("return_id").count().where("count > 1")
+    n_dups = dup_ids.count()
+    if n_dups > 0:
+        dup_rows = df.join(dup_ids.select("return_id"), "return_id")
+        issues.append(f"UNIQUENESS failure: {n_dups} return_id(s) appear more than once")
+        rejection_frames.append(
+            dup_rows.select("*").withColumn("rejection_rule", F.lit("UNIQUENESS – duplicate return_id"))
+        )
+
+    # ── Combine rejections ────────────────────────────────────────
+    if rejection_frames:
+        from functools import reduce
+        rejections = reduce(lambda a, b: a.unionByName(b), rejection_frames)
+    else:
+        rejections = None
+
+    passed = len(issues) == 0
+    detail = {
+        "table": table_name,
+        "total_rows": df.count(),
+        "distinct_return_ids": df.select("return_id").distinct().count(),
+        "rows_with_null_required": n_missing,
+        "duplicate_return_ids": n_dups,
+        "passed": passed,
+        "issues": issues,
+    }
+    return passed, detail, rejections
+
+# ═══════════════════════════════════════════════════════════════════
+# 2-A  Assess returns_initial  (expect REJECTION)
+# ═══════════════════════════════════════════════════════════════════
+initial_ok, initial_detail, initial_rejections = check_batch(INITIAL_TABLE)
+print("── returns_initial ──")
+print(json.dumps(initial_detail, indent=2))
+assert not initial_ok, "Expected returns_initial to FAIL the data contract"
+
+print("\nRejected records (initial batch):")
+display(initial_rejections.orderBy("return_id"))
+
+# Persist rejection evidence so it survives re-runs and is available for export
+initial_rejections.orderBy("return_id").write.mode("overwrite").saveAsTable(
+    f"{OUTPUT_SCHEMA}.batch_rejections_initial"
+)
+print(f"Rejection evidence saved → {OUTPUT_SCHEMA}.batch_rejections_initial")
+
+# ═══════════════════════════════════════════════════════════════════
+# 2-B  Assess returns_corrected  (expect PASS)
+# ═══════════════════════════════════════════════════════════════════
+corrected_ok, corrected_detail, corrected_rejections = check_batch(CORRECTED_TABLE)
+print("\n── returns_corrected ──")
+print(json.dumps(corrected_detail, indent=2))
+assert corrected_ok, (
+    f"returns_corrected also failed the data contract: {corrected_detail['issues']}"
+)
+print("\n✅ returns_corrected passes both COMPLETENESS and UNIQUENESS checks.")
+print("   → This batch will be used for the feature table in Section 3.")
+
+# ═══════════════════════════════════════════════════════════════════
+# 2-C  Export rejection evidence to the Git repo outputs folder
+# ═══════════════════════════════════════════════════════════════════
+rej_pdf = spark.table(f"{OUTPUT_SCHEMA}.batch_rejections_initial").toPandas()
+rej_pdf = rej_pdf.astype({"tax_year": "Int64", "income": "Int64", "deduction": "Int64"})
+
+rej_csv = repo_root / "outputs" / "batch-rejections-initial.csv"
+rej_pdf.to_csv(rej_csv, index=False)
+
+import pandas as pd
+check = pd.read_csv(rej_csv)
+print(f"\nRejection CSV written ({len(check)} rows): {rej_csv}")
+print(rej_csv.read_text())
+
+# Summary JSON for downstream evidence
+decision = {
+    "decision": "USE returns_corrected",
+    "reason": (
+        "returns_initial violates the data contract: "
+        "(1) COMPLETENESS – return R02 has NULL income (a required field); "
+        "(2) UNIQUENESS – return_id R01 appears twice (exact duplicate row). "
+        "These records are preserved in batch_rejections_initial and the CSV export. "
+        "returns_corrected passes both rules with 12 unique return_ids and no NULLs."
+    ),
+    "initial_check": initial_detail,
+    "corrected_check": corrected_detail,
+}
+decision_path = repo_root / "outputs" / "batch-decision.json"
+decision_path.write_text(json.dumps(decision, indent=2) + "\n", encoding="utf-8")
+print(f"\nDecision JSON written: {decision_path}")
+print(json.dumps(decision, indent=2))
 
 # COMMAND ----------
 
