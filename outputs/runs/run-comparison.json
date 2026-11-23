@@ -1,0 +1,30 @@
+{
+  "previous_run": {
+    "run_timestamp_utc": "2026-11-23T07:49:21+00:00",
+    "notebook_url": "https://dbc-48a16403-f66f.cloud.databricks.com/editor/notebooks/127024866559883",
+    "row_counts": {
+      "return_features": 12,
+      "features_train": 4,
+      "features_validation": 4,
+      "features_test": 4
+    },
+    "snapshot_file": "outputs/runs/run-latest.csv",
+    "snapshot_sha256": "920db8546e8dea08e506e347c86ed49253fc000f707e592d4ad6466d95d55e1f"
+  },
+  "latest_run": {
+    "run_timestamp_utc": "2026-11-23T07:51:03+00:00",
+    "notebook_url": "https://dbc-48a16403-f66f.cloud.databricks.com/editor/notebooks/127024866559883",
+    "row_counts": {
+      "return_features": 12,
+      "features_train": 4,
+      "features_validation": 4,
+      "features_test": 4
+    },
+    "snapshot_file": "outputs/runs/run-latest.csv",
+    "snapshot_sha256": "920db8546e8dea08e506e347c86ed49253fc000f707e592d4ad6466d95d55e1f"
+  },
+  "rows_compared": 24,
+  "same_return_ids_per_table": true,
+  "identical_ids_and_values": true,
+  "same_row_counts": true
+}

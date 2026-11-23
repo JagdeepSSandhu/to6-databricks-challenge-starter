@@ -46,6 +46,27 @@ OUTPUT_SCHEMA
 
 # COMMAND ----------
 
+# DBTITLE 1,Source references: lineage view, Catalog comments, sample rows
+import pyspark.sql.functions as F
+# Source references: supplied lineage view and Catalog table comments
+lineage = spark.table(LINEAGE_VIEW)
+display(lineage)
+
+table_comments = {
+    t: spark.sql(f"DESCRIBE TABLE EXTENDED {t}")
+        .where(F.col("col_name") == "Comment").select("data_type").first()["data_type"]
+    for t in [INITIAL_TABLE, CORRECTED_TABLE, f"{INPUT_SCHEMA}.parsed_source"]
+}
+
+print(table_comments)
+print("\n")
+
+for t in [INITIAL_TABLE, CORRECTED_TABLE]:
+    print(f"sample rows: {t}")
+    display(spark.table(t).orderBy("return_id").limit(5))
+
+# COMMAND ----------
+
 # DBTITLE 1,Full-batch profile: years, missing values, duplicates, zero income
 # Full-batch profile of both delivered tables (all rows, not just the samples above)
 REQUIRED_COLS = ["return_id", "taxpayer_id", "tax_year", "income", "deduction"]
@@ -269,7 +290,114 @@ print(json.dumps(decision, indent=2))
 
 # COMMAND ----------
 
+# DBTITLE 1,Build, save and verify feature table
+from pyspark.sql import functions as F
 
+# ═══════════════════════════════════════════════════════════════════
+# 3-A  Build the feature table from the accepted batch
+# ═══════════════════════════════════════════════════════════════════
+# Source: returns_corrected (passed data-contract checks in Section 2)
+# Columns kept: return_id, tax_year, deduction_to_income (derived)
+# Dropped:      taxpayer_id (filer identifier — need-to-know rule)
+#               income, deduction (raw amounts — need-to-know rule)
+# Zero-income handling: deduction / 0 → NULL (not filtered out)
+
+corrected_df = spark.table(CORRECTED_TABLE)
+
+features_df = (
+    corrected_df
+    .withColumn(
+        "deduction_to_income",
+        F.when(F.col("income") == 0, F.lit(None).cast("double"))
+         .otherwise((F.col("deduction") / F.col("income")).cast("double")),
+    )
+    .select("return_id", "tax_year", "deduction_to_income")
+)
+
+# Quick sanity display before saving
+print("Feature table preview (all rows):")
+display(features_df.orderBy("return_id"))
+
+# ═══════════════════════════════════════════════════════════════════
+# 3-B  Save as a managed Delta table
+# ═══════════════════════════════════════════════════════════════════
+FEATURE_TABLE = f"{OUTPUT_SCHEMA}.return_features"
+
+features_df.write.mode("overwrite").saveAsTable(FEATURE_TABLE)
+print(f"\n✅ Feature table saved → {FEATURE_TABLE}")
+
+# ═══════════════════════════════════════════════════════════════════
+# 3-C  Verify by reading the saved table back
+# ═══════════════════════════════════════════════════════════════════
+saved_df = spark.table(FEATURE_TABLE)
+saved_rows = saved_df.count()
+saved_cols = set(saved_df.columns)
+
+# -- Schema check: exactly 3 columns, no PII or raw amounts
+assert saved_cols == {"return_id", "tax_year", "deduction_to_income"}, (
+    f"Unexpected columns: {saved_cols}"
+)
+print(f"Schema check passed: {sorted(saved_cols)}")
+
+# -- Row count: must equal the accepted batch (12 unique returns)
+expected_count = corrected_df.select("return_id").distinct().count()  # 12
+assert saved_rows == expected_count, (
+    f"Row count mismatch: saved {saved_rows}, expected {expected_count}"
+)
+print(f"Row count check passed: {saved_rows} rows (matches {expected_count} accepted returns)")
+
+# -- Spot-check a nonzero ratio against a value derived from source
+# Pick a known return from returns_corrected and compute expected ratio
+sample_row = (
+    corrected_df
+    .where((F.col("income") > 0) & (F.col("deduction") > 0))
+    .orderBy("return_id")
+    .first()
+)
+expected_ratio = round(sample_row["deduction"] / sample_row["income"], 10)
+saved_ratio = round(
+    saved_df.where(F.col("return_id") == sample_row["return_id"])
+    .first()["deduction_to_income"],
+    10,
+)
+assert abs(saved_ratio - expected_ratio) < 1e-9, (
+    f"Ratio mismatch for {sample_row['return_id']}: "
+    f"saved {saved_ratio}, expected {expected_ratio}"
+)
+print(
+    f"Spot-check passed: {sample_row['return_id']} → "
+    f"deduction/income = {sample_row['deduction']}/{sample_row['income']} = "
+    f"{expected_ratio} (saved: {saved_ratio})"
+)
+
+# -- Zero-income check: these returns must exist with NULL ratio
+zero_income_ids = [
+    r["return_id"]
+    for r in corrected_df.where(F.col("income") == 0)
+    .select("return_id")
+    .orderBy("return_id")
+    .collect()
+]
+assert len(zero_income_ids) > 0, "Expected at least one zero-income return in source"
+
+for rid in zero_income_ids:
+    row = saved_df.where(F.col("return_id") == rid).first()
+    assert row is not None, f"Zero-income return {rid} missing from feature table"
+    assert row["deduction_to_income"] is None, (
+        f"{rid} should have NULL ratio but got {row['deduction_to_income']}"
+    )
+print(
+    f"Zero-income check passed: {zero_income_ids} present with NULL deduction_to_income"
+)
+
+# -- No duplicates
+assert saved_df.groupBy("return_id").count().where("count > 1").count() == 0, (
+    "Duplicate return_ids found in saved feature table"
+)
+print("Uniqueness check passed: no duplicate return_ids")
+
+print(f"\n✅ All verification checks passed for {FEATURE_TABLE}")
+display(saved_df.orderBy("return_id"))
 
 # COMMAND ----------
 
@@ -280,4 +408,134 @@ print(json.dumps(decision, indent=2))
 
 # COMMAND ----------
 
-# Your implementation, rerun comparison and exports here.
+# DBTITLE 1,4-A Save year split tables, verify and export
+from pyspark.sql import functions as F
+from functools import reduce
+
+# ═══════════════════════════════════════════════════════════════════
+# 4-A  Year split tables built from the SAVED feature table
+# ═══════════════════════════════════════════════════════════════════
+FEATURE_TABLE = f"{OUTPUT_SCHEMA}.return_features"
+SPLITS = {"features_train": 2022, "features_validation": 2023, "features_test": 2024}
+FEATURE_COLS = ["return_id", "tax_year", "deduction_to_income"]
+
+features = spark.table(FEATURE_TABLE)
+
+# Guard: every saved feature row must belong to exactly one split year
+unassigned = features.where(F.col("tax_year").isNull() | ~F.col("tax_year").isin(list(SPLITS.values())))
+assert unassigned.count() == 0, "Feature rows with a tax_year outside 2022-2024 would be lost"
+
+# Overwrite (never append) so a rerun replaces the previous contents
+for name, year in SPLITS.items():
+    (features.where(F.col("tax_year") == year).select(FEATURE_COLS)
+        .write.mode("overwrite").option("overwriteSchema", "true")
+        .saveAsTable(f"{OUTPUT_SCHEMA}.{name}"))
+    print(f"Saved {OUTPUT_SCHEMA}.{name} (tax_year = {year})")
+
+# ── Read back and verify ───────────────────────────────────────────
+split_dfs = {name: spark.table(f"{OUTPUT_SCHEMA}.{name}") for name in SPLITS}
+summary = []
+for name, year in SPLITS.items():
+    df = split_dfs[name]
+    assert df.columns == FEATURE_COLS, f"{name} columns {df.columns}"
+    wrong_year = df.where(F.col("tax_year") != year).count()
+    dups = df.groupBy("return_id").count().where("count > 1").count()
+    assert wrong_year == 0, f"{name}: {wrong_year} rows not in {year}"
+    assert dups == 0, f"{name}: duplicate return_ids"
+    summary.append((name, year, df.count(), df.where(F.col("deduction_to_income").isNull()).count()))
+
+union_splits = reduce(lambda a, b: a.unionByName(b), split_dfs.values())
+n_features = features.count()
+n_accepted = spark.table(CORRECTED_TABLE).select("return_id").distinct().count()
+assert n_features == n_accepted, "Feature table does not hold every accepted return once"
+assert union_splits.count() == n_features, "Split row total differs from feature table"
+assert union_splits.select("return_id").distinct().count() == n_features, "A return_id appears in more than one split"
+assert union_splits.exceptAll(features).count() == 0, "Split rows not found in return_features"
+assert features.exceptAll(union_splits).count() == 0, "return_features rows missing from the splits"
+print(f"\nAll {n_accepted} accepted returns appear exactly once across the splits, each in its assigned year, "
+      "with values identical to return_features.")
+
+display(spark.createDataFrame(summary, "split_table string, tax_year int, rows long, null_ratio_rows long"))
+print("Zero-income returns in the splits (expect NULL ratio):")
+display(union_splits.where(F.col("deduction_to_income").isNull()).orderBy("return_id"))
+
+# ── Small CSV exports of the saved tables (read back from Catalog) ─
+export_tables = {"return_features": features, **split_dfs}
+for name, df in export_tables.items():
+    path = repo_root / "outputs" / f"{name}.csv"
+    df.orderBy("return_id").toPandas().to_csv(path, index=False)
+    print(f"Exported {path.name}: {len(path.read_text().splitlines()) - 1} rows")
+
+# COMMAND ----------
+
+# DBTITLE 1,4-B Run snapshot and two-run comparison
+import hashlib, json
+from datetime import datetime, timezone
+import pandas as pd
+
+# ═══════════════════════════════════════════════════════════════════
+# 4-B  Snapshot this run's IDs and values; compare with the previous run
+# ═══════════════════════════════════════════════════════════════════
+# Each complete run writes outputs/runs/run-latest.csv; the prior latest becomes run-previous.csv.
+run_dir = repo_root / "outputs" / "runs"
+run_dir.mkdir(exist_ok=True)
+latest, previous = run_dir / "run-latest.csv", run_dir / "run-previous.csv"
+log_path = run_dir / "run-log.json"
+run_log = json.loads(log_path.read_text()) if log_path.exists() else {}
+
+if latest.exists():
+    latest.replace(previous)
+    run_log["previous"] = run_log.get("latest")
+
+# Snapshot every saved output table (all rows, all columns), read back from the Catalog
+snapshot = reduce(
+    lambda a, b: a.unionByName(b),
+    [spark.table(f"{OUTPUT_SCHEMA}.{t}").select(F.lit(t).alias("table_name"), *FEATURE_COLS)
+     for t in ["return_features", *SPLITS]],
+).orderBy("table_name", "return_id")
+snapshot.toPandas().to_csv(latest, index=False)
+
+ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+run_info = {
+    "run_timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "notebook_url": f"{ctx.apiUrl().get()}/editor/notebooks/{ctx.notebookId().get()}",
+    "row_counts": {t: spark.table(f"{OUTPUT_SCHEMA}.{t}").count() for t in ["return_features", *SPLITS]},
+    "snapshot_file": "outputs/runs/run-latest.csv",
+    "snapshot_sha256": hashlib.sha256(latest.read_bytes()).hexdigest(),
+}
+run_log["latest"] = run_info
+log_path.write_text(json.dumps(run_log, indent=2) + "\n")
+print("This run:", json.dumps(run_info, indent=2))
+
+if previous.exists():
+    prev_df = pd.read_csv(previous, dtype=str, keep_default_na=False)
+    curr_df = pd.read_csv(latest, dtype=str, keep_default_na=False)
+    identical = prev_df.equals(curr_df)
+    comparison = {
+        "previous_run": run_log["previous"],
+        "latest_run": run_info,
+        "rows_compared": len(curr_df),
+        "same_return_ids_per_table": all(
+            set(prev_df[prev_df.table_name == t].return_id) == set(curr_df[curr_df.table_name == t].return_id)
+            for t in curr_df.table_name.unique()
+        ),
+        "identical_ids_and_values": identical,
+        "same_row_counts": run_log["previous"]["row_counts"] == run_info["row_counts"],
+    }
+    (run_dir / "run-comparison.json").write_text(json.dumps(comparison, indent=2) + "\n")
+    print("Comparison with previous run:", json.dumps({k: v for k, v in comparison.items() if not k.endswith("_run")}, indent=2))
+    assert identical and comparison["same_row_counts"], "Rerun changed IDs, values or row counts"
+    print("\u2705 Two complete runs left identical return IDs and values, with no appended copies.")
+else:
+    print("First recorded run; run the whole notebook again to produce the comparison.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Handoff
+# MAGIC %md
+# MAGIC ### Handoff
+# MAGIC * **Input used:** `training.to6_challenge3_inputs.returns_corrected` (from `parsed_source`, per `source_lineage`). `returns_initial` was rejected (evidence in `batch_rejections_initial`).
+# MAGIC * **Outputs** (schema `training.to6_c3_aa72a91315d8`): `return_features`, `features_train` (2022), `features_validation` (2023), `features_test` (2024). Columns: `return_id`, `tax_year`, `deduction_to_income`.
+# MAGIC * **Ratio:** `deduction_to_income = deduction / income`; NULL when income is 0 (the return is kept).
+# MAGIC * **Checks:** completeness and uniqueness on both batches; feature readback (schema, 12 rows, R01 = 20/100 = 0.2, zero-income R03/R09 NULL, no duplicates); split readback (correct year only, each accepted return in exactly one split, values identical to `return_features`); two complete runs compared row by row in `outputs/runs/run-comparison.json`.
+# MAGIC * **Not verified:** lineage beyond the supplied view; leakage and prediction-time availability (no labels in scope).
